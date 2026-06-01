@@ -14,10 +14,50 @@ def load_watermark_classes(watermark_impl):
     if watermark_impl == "spatial":
         from train import Encoder, Decoder
     elif watermark_impl == "freq":
-        from train_freq import Encoder, Decoder
+        try:
+            from train_freq import Encoder, Decoder
+        except ModuleNotFoundError as exc:
+            raise ModuleNotFoundError(
+                "watermark_impl=freq requires train_freq.py and matching frequency-domain weights."
+            ) from exc
     else:
         raise ValueError(f"Unsupported watermark_impl: {watermark_impl}")
     return Encoder, Decoder
+
+def default_weights_dir(watermark_impl):
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    if watermark_impl == "freq":
+        return os.path.join(base_dir, "weights_dwt_spread_v7_2")
+    if watermark_impl == "spatial":
+        return os.path.join(base_dir, "weights_strong_v5")
+    raise ValueError(f"Unsupported watermark_impl: {watermark_impl}")
+
+def resolve_weight_file(weights_dir, prefix):
+    candidates = [
+        f"{prefix}_final.pth",
+        f"{prefix}_best.pth",
+        f"{prefix}_clean_best.pth",
+        f"{prefix}_ft_best.pth",
+        f"{prefix}_ft_latest.pth",
+    ]
+    for filename in candidates:
+        path = os.path.join(weights_dir, filename)
+        if os.path.exists(path):
+            return path
+    raise FileNotFoundError(
+        f"No {prefix} weights found in {weights_dir}. Tried: {', '.join(candidates)}"
+    )
+
+def load_state_dict_checked(module, path, device, component_name):
+    state_dict = torch.load(path, map_location=device)
+    try:
+        module.load_state_dict(state_dict)
+    except RuntimeError as exc:
+        raise RuntimeError(
+            f"{component_name} weights at {path} do not match the current model "
+            "definition. Retrain the selected watermark implementation or pass a "
+            "matching --weights_dir."
+        ) from exc
 
 def get_cgroup_memory_limit_gib():
     try:
@@ -38,10 +78,11 @@ def canonicalize_model_id(model_id):
 def parse_args():
     parser = argparse.ArgumentParser(description="SD3.5 Watermark Generation and Extraction")
     
+    parser.add_argument("--name", type=str, required=True)
     # --- 模型与路径配置 ---
-    parser.add_argument("--model_id", type=str, default="stabilityai/stable-diffusion-3.5-large", help="SD3.5 model path or HuggingFace ID")
-    parser.add_argument("--weights_dir", type=str, default="./weights", help="Directory containing trained Encoder/Decoder weights")
-    parser.add_argument("--watermark_impl", type=str, choices=["freq", "spatial"], default="freq", help="Watermark model implementation to load")
+    parser.add_argument("--model_id", type=str, default="stabilityai/stable-diffusion-3.5-medium", help="SD3.5 model path or HuggingFace ID")
+    parser.add_argument("--weights_dir", type=str, default=None, help="Directory containing trained Encoder/Decoder weights")
+    parser.add_argument("--watermark_impl", type=str, choices=["spatial", "freq"], default="spatial", help="Watermark implementation to load")
     parser.add_argument("--memory_mode", type=str, choices=["auto", "cuda", "model_cpu_offload", "sequential_cpu_offload"], default="auto", help="Pipeline placement strategy")
     parser.add_argument("--disable_t5", action="store_true", help="Skip SD3/3.5 T5 text encoder to reduce RAM/VRAM use")
     parser.add_argument("--output_dir", type=str, default="./output_images", help="Base directory for output images and results")
@@ -51,6 +92,8 @@ def parse_args():
     parser.add_argument("--noise_ch", type=int, default=16, help="Latent channels (16 for SD3/3.5)")
     parser.add_argument("--msg_len", type=int, default=256, help="Length of the watermark message bits")
     parser.add_argument("--spatial", type=int, default=64, help="Spatial dimension of latents (e.g., 64 for 512x512 image)")
+    parser.add_argument("--stat_repeats", type=int, default=96, help="statmark repeats per bit; must match training")
+    parser.add_argument("--stat_key", type=int, default=20260526, help="statmark codebook key; must match training")
     
     # --- 生成与反演超参 ---
     parser.add_argument("--num_images", type=int, default=10, help="Total number of images to generate and test")
@@ -59,7 +102,7 @@ def parse_args():
     parser.add_argument("--guidance_scale", type=float, default=4.5, help="CFG scale for generation")
     parser.add_argument("--inverse_guidance_scale", type=float, default=None, help="CFG scale for inversion; defaults to 1.0 for empty prompt, generation guidance for same prompt")
     parser.add_argument("--inverse_prompt_mode", type=str, choices=["empty", "same"], default="empty", help="Use empty prompt or generation prompt during inversion")
-    parser.add_argument("--inverse_solver", type=str, choices=["fixed_point", "euler", "gradient_descent"], default="fixed_point")
+    parser.add_argument("--inverse_solver", type=str, choices=["fixed_point", "euler", "gradient_descent"], default="euler")
     parser.add_argument("--inverse_fixpoint_iters", type=int, default=10)
     parser.add_argument("--height", type=int, default=512, help="Image height")
     parser.add_argument("--width", type=int, default=512, help="Image width")
@@ -110,7 +153,9 @@ def main():
         )
     
     # 目录配置
-    experiment_name = f"test_run_{int(time.time())}"
+    if args.weights_dir is None:
+        args.weights_dir = default_weights_dir(args.watermark_impl)
+    experiment_name = f"{args.name}_{int(time.time())}"
     output_base_dir = os.path.join(args.output_dir, experiment_name)
     image_save_path = os.path.join(output_base_dir, "image")
     os.makedirs(image_save_path, exist_ok=True)
@@ -157,11 +202,21 @@ def main():
 
     print("⏳ 正在加载 Watermark Encoder & Decoder...")
     Encoder, Decoder = load_watermark_classes(args.watermark_impl)
-    encoder = Encoder(args.noise_ch, args.msg_len, args.spatial).to(device).to(weight_dtype)
-    decoder = Decoder(args.noise_ch, args.msg_len).to(device)
+    if args.watermark_impl == "freq":
+        encoder = Encoder(args.noise_ch, args.msg_len, args.spatial).to(device).to(weight_dtype)
+        decoder = Decoder(args.noise_ch, args.msg_len, args.spatial).to(device)
+    elif args.watermark_impl == "spatial":
+        encoder = Encoder(args.noise_ch, args.msg_len, args.spatial).to(device).to(weight_dtype)
+        decoder = Decoder(args.noise_ch, args.msg_len).to(device)
+    else:
+        raise ValueError(f"Unsupported watermark_impl: {args.watermark_impl}")
 
-    encoder.load_state_dict(torch.load(os.path.join(args.weights_dir, "encoder_best.pth"), map_location=device))
-    decoder.load_state_dict(torch.load(os.path.join(args.weights_dir, "decoder_best.pth"), map_location=device))
+    encoder_path = resolve_weight_file(args.weights_dir, "encoder")
+    decoder_path = resolve_weight_file(args.weights_dir, "decoder")
+    load_state_dict_checked(encoder, encoder_path, device, "Encoder")
+    load_state_dict_checked(decoder, decoder_path, device, "Decoder")
+    print(f"✅ Encoder weights: {encoder_path}")
+    print(f"✅ Decoder weights: {decoder_path}")
     
     encoder.eval()
     decoder.eval()

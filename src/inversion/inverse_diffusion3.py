@@ -9,7 +9,10 @@ class InversionDiffusion3Pipeline(StableDiffusion3Pipeline):
             encoding = encoding_dist.sample(generator=rng_generator)
         else:
             encoding = encoding_dist.mode()
-        latents = encoding * self.vae.config.scaling_factor
+        shift_factor = getattr(self.vae.config, "shift_factor", 0.0)
+        if shift_factor is None:
+            shift_factor = 0.0
+        latents = (encoding - shift_factor) * self.vae.config.scaling_factor
         return latents
     
     @torch.inference_mode()
@@ -155,7 +158,7 @@ class InversionDiffusion3Pipeline(StableDiffusion3Pipeline):
         num_inference_steps=40,
         guidance_scale=1.0,
         num_images_per_prompt=1,
-        inverse_solver="fixed_point",
+        inverse_solver="euler",
         inverse_fixpoint_iters=10,
         lr=0.05, # 【新增参数】梯度下降的初始学习率
     ):
